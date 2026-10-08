@@ -48,6 +48,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0]['normalized_to_seq_read'], '1.000000')
         self.assertEqual(rows[2]['normalized_to_seq_read'], '2.000000')
+        self.assertEqual(rows[3]['workload'], 'legacy_uniform_4KiB_python_512B_payload_QD1')
         self.assertEqual(rows[3]['effective_bw_GiB_s'], '0.062500')
         self.assertEqual(rows[3]['normalized_to_seq_read'], '0.015625')
         for name, contents in before.items():
@@ -60,6 +61,20 @@ class SummaryTests(unittest.TestCase):
         result = self.run_summary('saved result')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.read_output()), 3)
+
+    def test_macos_workers_and_matched_sequential_rows(self):
+        write_csv(self.folder / 'summary.csv', [
+            dict(profile='seq_read', block_bytes=1048576, queue_depth=1, jobs=4, engine='psync', read_GiB_s_median=4),
+            dict(profile='random_read_low_qd', block_bytes=4096, queue_depth=1, jobs=1, engine='psync', read_GiB_s_median=.5),
+            dict(profile='random_read_high_qd', block_bytes=4096, queue_depth=1, jobs=4, engine='psync', read_GiB_s_median=1),
+            dict(profile='matched_seq_high_qd', block_bytes=4096, queue_depth=1, jobs=4, engine='psync', read_GiB_s_median=2)])
+        result = self.run_summary()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.read_output()
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len({r['workload'] for r in rows}), 4)
+        self.assertIn('4workers', rows[0]['workload'])
+        self.assertTrue(any(r['workload'].startswith('matched_seq') for r in rows))
 
     def test_zero_reference_does_not_overwrite_previous_summary(self):
         original = b'preserve me'

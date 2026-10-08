@@ -15,6 +15,7 @@ import time
 import types
 import unittest
 from contextlib import redirect_stderr
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'bench.sh'
@@ -33,7 +34,7 @@ def read_csv(path):
 
 def row(name, bs, qd, bandwidth, rep):
     return {'label': 'test', 'profile': name, 'block_bytes': bs, 'queue_depth': qd,
-            'engine': 'libaio', 'file_size_bytes': 2 ** 30, 'runtime_requested_s': 1, 'ramp_s': 0,
+            'jobs': 1, 'host_page_cache_bypass_verified': 1, 'engine': 'libaio', 'file_size_bytes': 2 ** 30, 'runtime_requested_s': 1, 'ramp_s': 0,
             'repetition': rep, 'read_GiB_s': bandwidth, 'read_MB_s': bandwidth * 2 ** 30 / 1e6,
             'read_IOPS': bandwidth * 2 ** 30 / bs, 'clat_mean_us': 100, 'clat_p50_us': 80,
             'clat_p99_us': 500, 'fio_fd_O_DIRECT_verified': 1}
@@ -103,7 +104,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(bench.DarwinIO.RusageV2.write_bytes.offset, 152)
 
     def test_capped_queue_is_not_reported_as_achieved(self):
-        state, pct = bench.depth_assessment(128, {'16': 99.9, '>=64': .1})
+        state, pct = bench.depth_assessment(128, {'16': 98, '>=64': 2})
         self.assertEqual(state, 'below_requested_depth_bucket')
         state, pct = bench.depth_assessment(128, {'>=64': 99.9})
         self.assertEqual(state, 'observed_ge64_exact_depth_unknown')
@@ -112,6 +113,7 @@ class AnalysisTests(unittest.TestCase):
     def test_missing_workload_reference_is_blank(self):
         work = {'label': 'test', 'workload': 'embedding', 'kind': 'pattern_proxy',
                 'physical_request_bytes': 4096, 'useful_request_bytes': 512,
+                'queue_depth': 1, 'jobs': 1, 'engine': 'libaio',
                 'file_size_bytes': 2 ** 30, 'runtime_requested_s': 1, 'ramp_s': 0,
                 'storage_GiB_s': .08, 'useful_GiB_s': .01, 'io_amplification': 8}
         refs = [row('seq_read', 1048576, 32, 4, 1), row('random_read_low_qd', 16384, 1, .2, 1)]
@@ -121,6 +123,71 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(result['useful_vs_seq_pct'], .25)
             self.assertEqual(result['random_low_QD_GiB_s'], '')
             self.assertEqual(result['storage_vs_random_low_QD_pct'], '')
+
+    def test_matched_pairs_and_worker_file_regions(self):
+        args = bench.parse_args(['--engine', 'libaio', '--high-jobs', '4', '--high-qd', '32', '--matched-seq'])
+        profiles = bench.profiles(args)
+        self.assertEqual(len(profiles), 17)
+        for p in [p for p in profiles if p['rw'] == 'randread']:
+            matched = next(r for r in profiles if r['profile'] == p['profile'].replace('random_read', 'matched_seq')
+                           and r['block_bytes'] == p['block_bytes'])
+            self.assertEqual((p['qd'], p['jobs']), (matched['qd'], matched['jobs']))
+        high = next(p for p in profiles if p['profile'] == 'random_read_high_qd')
+        cmd = bench.measurement_command([], args, high, 1, Path('test.json'), 'test')
+        self.assertIn('--numjobs=4', cmd)
+        self.assertIn('--offset_increment=' + str(args.size // 4), cmd)
+        self.assertIn('--size=' + str(args.size // 4), cmd)
+        self.assertIn('--lat_percentiles=1', cmd)
+
+    def test_macos_profiles_use_workers_instead_of_async_qd(self):
+        with patch.object(bench, 'SYSTEM', 'Darwin'):
+            args = bench.parse_args(['--engine', 'psync'])
+        profiles = bench.profiles(args) + bench.pattern_profiles(args)
+        self.assertTrue(all(p['qd'] == 1 for p in profiles))
+        self.assertEqual(next(p['jobs'] for p in profiles if p['profile'] == 'random_read_high_qd'), 4)
+        self.assertIn('parallel_uniform_4k', [p['profile'] for p in profiles])
+
+    def test_total_latency_and_cpu_pressure_are_not_hidden(self):
+        latency = lambda mean: {'mean': mean, 'percentile': {'50.000000': mean, '95.000000': mean * 2,
+                            '99.000000': mean * 3, '99.900000': mean * 4}}
+        read = {'io_bytes': 409600, 'runtime': 1000, 'bw_bytes': 409600, 'iops': 100,
+                'lat_ns': latency(26400), 'clat_ns': latency(13700), 'slat_ns': {'mean': 12700}}
+        args = bench.parse_args(['--engine', 'libaio'])
+        job = {'read': read, 'usr_cpu': 10.2, 'sys_cpu': 85, 'iodepth_level': {'16': 98, '>=64': 2}}
+        audit = {'direct_fd': {'verified': True}, 'host_block_read_coverage_verified': True,
+                 'host_block_read_bytes': 409600, 'temperature_start_c': {}, 'temperature_peak_c': None, 'started_utc': ''}
+        profile = next(p for p in bench.profiles(args) if p['profile'] == 'random_read_high_qd')
+        actual = bench.metric_row(args, profile, 1, job, audit)
+        self.assertAlmostEqual(actual['lat_mean_us'], 26.4)
+        self.assertAlmostEqual(actual['slat_mean_us'], 12.7)
+        self.assertAlmostEqual(actual['lat_p99_9_us'], 105.6)
+        self.assertIn('host_cpu_pressure_possible', actual['warnings'])
+        self.assertIn('below_requested_depth_bucket', actual['warnings'])
+        self.assertEqual(actual['media_cache_bypass_verified'], 0)
+        read['slat_ns'] = {'N': 0, 'mean': 0}
+        self.assertEqual(bench.latency_metrics(read)['slat_mean_us'], '')
+
+    def test_storage_chain_finds_partition_parent_and_rejects_dm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sysdev = root / 'dev'; sysdev.mkdir()
+            disk = root / 'nvme0n1'; disk.mkdir()
+            (disk / 'stat').write_text('1 0 8 0')
+            part = disk / 'nvme0n1p1'; part.mkdir(); (part / 'partition').write_text('1')
+            dev = root.stat().st_dev
+            link = sysdev / ('%d:%d' % (os.major(dev), os.minor(dev)))
+            link.symlink_to(part, target_is_directory=True)
+            found = bench.linux_storage_path(root, sysdev)
+            self.assertEqual(list(found['leaf_stat_paths']), ['nvme0n1'])
+            self.assertEqual(bench.block_reads({'storage_path': found}), {'nvme0n1': 4096})
+            link.unlink()
+            dm = root / 'dm-0'; (dm / 'slaves').mkdir(parents=True)
+            (dm / 'slaves' / 'nvme0n1p1').symlink_to(part, target_is_directory=True)
+            link.symlink_to(dm, target_is_directory=True)
+            found = bench.linux_storage_path(root, sysdev)
+            self.assertEqual(found['rejected_layers'], ['dm-0'])
+            self.assertEqual(list(found['leaf_stat_paths']), ['nvme0n1'])
+
 
 
 @unittest.skipUnless(INTEGRATION, 'pass --integration to exercise a real local filesystem and fio')
@@ -149,12 +216,12 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(env['status'], 'complete')
         runs = read_csv(self.out / 'runs.csv')
         self.assertEqual(len(runs), 18)
-        self.assertTrue(all(r['cache_bypass_verified'] == '1' for r in runs))
+        self.assertTrue(all(r['host_page_cache_bypass_verified'] == '1' for r in runs))
         native_field = 'fio_fd_F_NOCACHE_verified' if bench.SYSTEM == 'Darwin' else 'fio_fd_O_DIRECT_verified'
         self.assertTrue(all(r[native_field] == '1' for r in runs))
         self.assertTrue(all(r['cache_mode'] == bench.CACHE_MODE for r in runs))
         if bench.SYSTEM == 'Darwin':
-            self.assertTrue(all(r['engine'] == 'posixaio' for r in runs))
+            self.assertTrue(all(r['engine'] == 'psync' for r in runs))
             self.assertTrue(all(r['fio_fd_O_DIRECT_verified'] == '' for r in runs))
         self.assertTrue(all(float(r['read_GiB_s']) > 0 for r in runs))
         self.assertTrue(all(r['label'] == 'test,한국어' for r in runs))
@@ -164,11 +231,21 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(read_csv(self.out / 'comparison.csv')), 4)
         work = read_csv(self.out / 'workload_comparison.csv')
         self.assertEqual(len(work), 3)
-        embedding = next(r for r in work if r['workload'] == 'embedding_lookup_512b')
-        self.assertGreaterEqual(float(embedding['io_amplification_median']), 8)
-        self.assertGreaterEqual(float(embedding['storage_GiB_s_median']) + 1e-9,
-                                8 * float(embedding['useful_GiB_s_median']))
-        self.assertTrue(all(r['low_random_QD_matches_workload'] == '1' for r in work))
+        self.assertEqual({r['workload'] for r in work}, {'zipf_read_4k', 'contiguous_run_16k',
+                         'parallel_uniform_4k' if bench.SYSTEM == 'Darwin' else 'batched_uniform_4k'})
+        self.assertTrue(all(r['storage_GiB_s_median'] == r['useful_GiB_s_median'] for r in work))
+        patterns = read_csv(self.out / 'workload_runs.csv')
+        for r in runs + patterns:
+            self.assertGreaterEqual(float(r['lat_mean_us']), float(r['clat_mean_us']))
+            self.assertGreater(float(r['lat_p99_9_us']), 0)
+            self.assertEqual(r['media_cache_bypass_verified'], '0')
+            if bench.SYSTEM == 'Linux':
+                self.assertEqual(r['host_block_read_coverage_verified'], '1')
+        # All profiles use fio and participate in one shuffled schedule.
+        commands = sorted((self.out / 'raw').glob('*.command.json'))
+        self.assertEqual(len(commands), 25)
+        epochs = sorted(r['started_utc'] for r in patterns)
+        self.assertTrue(any(r['started_utc'] > epochs[0] for r in runs))
         probe = json.loads((self.out / 'direct_io_validation.json').read_text())
         self.assertEqual(probe['cache_mode'], bench.CACHE_MODE)
         for attempt in probe['repeated_same_range_reads']:
@@ -196,6 +273,19 @@ class IntegrationTests(unittest.TestCase):
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=20)
+
+    def test_multiple_workers_and_matched_sequential_references(self):
+        cmd = self.cmd + ['--repeats', '1', '--random-bs', '4K', '--workloads', 'none',
+                          '--high-jobs', '4', '--high-qd', '32', '--matched-seq']
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = read_csv(self.out / 'matched_random_comparison.csv')
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r['jobs'] for r in rows}, {'1', '4'})
+        for r in rows:
+            self.assertAlmostEqual(float(r['random_to_matched_seq']),
+                                   float(r['random_GiB_s']) / float(r['sequential_GiB_s']))
+        self.assert_clean()
 
     def test_ram_filesystem_fails_closed(self):
         if bench.SYSTEM != 'Linux' or not Path('/dev/shm').is_dir():

@@ -61,7 +61,8 @@ def clean_rows(folder):
         raise ValueError('seq_read bandwidth must be greater than zero')
 
     # One measured sequential reference, followed by size/QD-matched fio rows.
-    profiles = {'seq_read', 'random_read_low_qd', 'random_read_high_qd'}
+    profiles = {'seq_read', 'random_read_low_qd', 'random_read_high_qd',
+                'matched_seq_low_qd', 'matched_seq_high_qd'}
     prepared = []
     for row in summary:
         profile = row.get('profile')
@@ -69,10 +70,20 @@ def clean_rows(folder):
             raise ValueError('Unknown profile in summary.csv: %r' % profile)
         bs = integer(row, 'block_bytes', 'summary.csv')
         qd = integer(row, 'queue_depth', 'summary.csv')
-        name = ('seq_read' if profile == 'seq_read' else 'random_read')
+        jobs = integer(row, 'jobs', 'summary.csv') if row.get('jobs') else 1
+        name = 'seq_read' if profile == 'seq_read' else ('matched_seq' if profile.startswith('matched_seq') else 'random_read')
         name += '_%s_QD%d' % (block_label(bs), qd)
+        if jobs > 1:
+            name += '_%dworkers' % jobs
+        # Distinguish a psync high tier explicitly configured with one worker.
+        if row.get('engine') == 'psync':
+            name += '_psync'
+            if profile.endswith('high_qd'):
+                name += '_high'
+            elif profile.endswith('low_qd'):
+                name += '_low'
         bw = number(row, 'read_GiB_s_median', 'summary.csv')
-        prepared.append(((profile != 'seq_read', bs, qd), name, bw))
+        prepared.append(((profile != 'seq_read', bs, qd, jobs, profile), name, bw))
     prepared.sort(key=lambda item: item[0])
     result = [(name, bw) for _, name, bw in prepared]
 
@@ -83,8 +94,15 @@ def clean_rows(folder):
             name = row.get('workload', '').strip()
             if not name:
                 raise ValueError('workload_comparison.csv: missing workload name')
-            # Effective BW counts useful payload, so 512 B embeddings are not
-            # inflated to the 4 KiB fetched by the underlying storage request.
+            legacy = {'gnn_feature_gather_4k': 'legacy_uniform_4KiB_python_QD1',
+                      'embedding_lookup_512b': 'legacy_uniform_4KiB_python_512B_payload_QD1',
+                      'token_fetch_16k': 'legacy_uniform_16KiB_python_QD1'}
+            name = legacy.get(name, name)
+            if row.get('workload_QD') and not name.startswith('legacy_'):
+                name += '_QD%d' % integer(row, 'workload_QD', 'workload_comparison.csv')
+                if row.get('jobs') and integer(row, 'jobs', 'workload_comparison.csv') > 1:
+                    name += '_%dworkers' % integer(row, 'jobs', 'workload_comparison.csv')
+            # Preserve saved useful-payload accounting, including legacy 512 B rows.
             bw = number(row, 'useful_GiB_s_median', 'workload_comparison.csv')
             result.append((name, bw))
     elif (folder / 'workload_runs.csv').exists():
