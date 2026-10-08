@@ -1,5 +1,32 @@
 # Storage I/O benchmark
 
+## 기존 결과를 3열 CSV로 정리
+
+```sh
+git pull
+sh summarize.sh storage-results/20261008T010819Z-zrd1rvk9
+```
+
+지정한 폴더의 **`normalized.csv`**를 만듭니다. 기존 `summary.csv`와
+`workload_comparison.csv`만 읽으며 벤치마크를 다시 실행하지 않습니다.
+Linux와 macOS에서 Python3만 있으면 실행할 수 있습니다.
+폴더명만 지정하는 `sh summarize.sh 20261008T010819Z-zrd1rvk9`도 가능합니다.
+
+| 열 | 의미 |
+|---|---|
+| `workload` | 워크로드명. fio 항목은 요청 크기·QD를 이름에 포함 |
+| `effective_bw_GiB_s` | 저장된 반복 측정의 중앙값. AI 접근 패턴은 **유효 데이터/시간** |
+| `normalized_to_seq_read` | 해당 effective BW ÷ 순차 읽기 BW. **순차 읽기 = 1.0** |
+
+순차 읽기, 요청 크기별 low/high-QD 랜덤 읽기, AI 접근 패턴 순으로 한 행씩 정리합니다.
+fio 항목은 `read_GiB_s_median`, AI 항목은 `useful_GiB_s_median`을 사용합니다.
+예를 들어 임베딩 조회는 실제 전달하는 512 B를 기준으로 하며, 물리적으로 읽은 4 KiB를
+effective BW로 부풀리지 않습니다. `--workloads none`으로 측정한 폴더도 지원합니다.
+정규화 기준은 같은 폴더의 `seq_read` 결과 한 개이며, 분모가 0이거나 모호하면 중단합니다.
+기존 측정 CSV는 보존하고, 다시 실행하면 파생 파일 `normalized.csv`만 갱신합니다.
+
+## 측정 실행
+
 **`sh bench.sh` 한 번으로 Direct I/O 실측과 비교 CSV를 생성합니다.**
 `bench.sh` 파일 하나에 실행 코드가 모두 들어 있습니다. **Linux와 macOS**에서 동작하며 Python 3.8 이상,
 Flexible I/O Tester **fio 3.x**가 필요하며 Python 추가 패키지나 GPU, root 권한은 필요하지 않습니다.

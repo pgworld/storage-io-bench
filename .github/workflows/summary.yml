@@ -1,0 +1,20 @@
+name: Saved CSV summary
+on:
+  push:
+    branches: [main]
+    paths: [summarize.sh, 'checks/**', '.github/workflows/summary.yml']
+  pull_request:
+    paths: [summarize.sh, 'checks/**', '.github/workflows/summary.yml']
+permissions:
+  contents: read
+jobs:
+  csv-only:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n summarize.sh
+      - run: python3 checks/test_summary.py
