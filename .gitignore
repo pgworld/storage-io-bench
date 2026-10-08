@@ -1,0 +1,4 @@
+/storage-results/
+__pycache__/
+*.pyc
+.storage-io-bench-*/
