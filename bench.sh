@@ -843,7 +843,8 @@ def main(argv=None):
             base = fio_base(fio, args, data)
             cooling(env, args)
             print('Preparing a fully written data file (' + CACHE_MODE + ' + fsync)...', flush=True)
-            prep_cmd = base + ['--name=prepare', '--rw=write', '--bs=1M', '--iodepth=32',
+            prep_cmd = base + ['--name=prepare', '--rw=write', '--bs=1M',
+                               '--iodepth=' + ('1' if args.engine == 'psync' else '32'),
                                '--refill_buffers=1', '--scramble_buffers=1', '--end_fsync=1',
                                '--output=' + str(out / 'raw' / 'prepare.json')]
             job, _ = run_fio(prep_cmd, 'prepare', out, data, env, max(300, args.size / MIB * 2), False)
@@ -891,10 +892,11 @@ def main(argv=None):
         write_tables(out, rows)
         workload_tables(out, work_rows, rows)
     summary = summarize(rows)
-    print('\n%-26s %8s %5s %12s %12s %12s' % ('Profile', 'KiB', 'QD', 'GiB/s med', 'IOPS med', 'p99 us med'))
+    print('\n%-26s %8s %6s %5s %12s %12s %12s' %
+          ('Profile', 'KiB', 'QD/job', 'jobs', 'GiB/s med', 'IOPS med', 'p99 us med'))
     for r in summary:
-        print('%-26s %8g %5d %12.3f %12.0f %12.1f' %
-              (r['profile'], r['block_bytes'] / 1024, r['queue_depth'], r['read_GiB_s_median'],
+        print('%-26s %8g %6d %5d %12.3f %12.0f %12.1f' %
+              (r['profile'], r['block_bytes'] / 1024, r['queue_depth'], r['jobs'], r['read_GiB_s_median'],
                r['read_IOPS_median'], r['lat_p99_us_median']))
     print('\nCSV comparison: %s\nCSV summary:    %s\nCSV per-run:    %s' %
           (out / 'comparison.csv', out / 'summary.csv', out / 'runs.csv'), flush=True)
