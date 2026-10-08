@@ -1,5 +1,5 @@
 #!/bin/sh
-# Standalone Linux direct-I/O benchmark. Only Python 3.8+ and fio are required.
+# Standalone Linux/macOS uncached-I/O benchmark. Python 3.8+ and fio required.
 set -eu
 if ! command -v python3 >/dev/null 2>&1; then
     echo 'ERROR: python3 (3.8 or newer) is required.' >&2
@@ -8,6 +8,7 @@ fi
 exec python3 - "$@" <<'PY'
 import argparse
 import csv
+import ctypes
 import datetime as dt
 import fcntl
 import json
@@ -15,19 +16,117 @@ import mmap
 import os
 from pathlib import Path
 import platform
+import plistlib
 import random
 import re
 import shutil
 import signal
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 GIB = 1024 ** 3
 MIB = 1024 ** 2
+SYSTEM = platform.system()
+CACHE_MODE = 'F_NOCACHE' if SYSTEM == 'Darwin' else 'O_DIRECT'
+# Darwin ABI constants from Apple's xnu bsd/sys/{fcntl,proc_info,resource}.h.
+F_NOCACHE = 48
+FNOCACHE = 0x00040000
+MAC = None
+
+
+class DarwinIO:
+    class RusageV2(ctypes.Structure):
+        _fields_ = [('uuid', ctypes.c_ubyte * 16), ('prefix', ctypes.c_uint64 * 16),
+                    ('read_bytes', ctypes.c_uint64), ('write_bytes', ctypes.c_uint64)]
+
+    def __init__(self):
+        self.libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        self.libproc.proc_pid_rusage.restype = ctypes.c_int
+        self.libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                             ctypes.c_void_p, ctypes.c_int]
+        self.libproc.proc_pidinfo.restype = ctypes.c_int
+        self.libproc.proc_pidfdinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_void_p, ctypes.c_int]
+        self.libproc.proc_pidfdinfo.restype = ctypes.c_int
+        self.libc.pread.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int64]
+        self.libc.pread.restype = ctypes.c_ssize_t
+
+    def io(self):
+        info = self.RusageV2()
+        if self.libproc.proc_pid_rusage(os.getpid(), 2, ctypes.byref(info)) != 0:
+            raise OSError(ctypes.get_errno(), 'proc_pid_rusage failed; cannot verify storage reads')
+        return {'read_bytes': info.read_bytes, 'write_bytes': info.write_bytes}
+
+    def read_into(self, fd, buf, offset):
+        pointer = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        got = self.libc.pread(fd, pointer, len(buf), offset)
+        if got < 0:
+            raise OSError(ctypes.get_errno(), 'uncached pread failed')
+        return got
+
+    def inspect_fd(self, pid, path):
+        # proc_fdinfo = int32 descriptor + uint32 type. Grow for concurrent opens.
+        size = self.libproc.proc_pidinfo(pid, 1, 0, None, 0)
+        if size <= 0:
+            return None
+        listing = ctypes.create_string_buffer(size + 4096)
+        got = self.libproc.proc_pidinfo(pid, 1, 0, listing, len(listing))
+        for offset in range(0, max(0, got) // 8 * 8, 8):
+            fd, kind = struct.unpack_from('=iI', listing.raw, offset)
+            if kind != 1:  # PROX_FDTYPE_VNODE
+                continue
+            info = ctypes.create_string_buffer(4096)
+            count = self.libproc.proc_pidfdinfo(pid, fd, 2, info, len(info))
+            # vnode_fdinfowithpath starts with fi_openflags and ends in char[1024].
+            if count < 1048 or count > len(info):
+                continue
+            name = os.fsdecode(info.raw[count - 1024:count].split(b'\0', 1)[0])
+            if name != str(path):
+                continue
+            flags = struct.unpack_from('=I', info.raw)[0]
+            if flags & FNOCACHE:
+                return {'fd': fd, 'flags_hex': hex(flags), 'F_NOCACHE': True,
+                        'method': 'proc_pidfdinfo(FNOCACHE)'}
+            # open() precedes fcntl(F_NOCACHE); only accept a verified later sample.
+        return None
+
+
+def darwin_io():
+    global MAC
+    if MAC is None:
+        MAC = DarwinIO()
+    return MAC
+
+
+def open_uncached(path):
+    fd = os.open(str(path), os.O_RDONLY | (os.O_DIRECT if SYSTEM == 'Linux' else 0))
+    try:
+        if SYSTEM == 'Darwin':
+            fcntl.fcntl(fd, F_NOCACHE, 1)
+        bit = FNOCACHE if SYSTEM == 'Darwin' else os.O_DIRECT
+        if not fcntl.fcntl(fd, fcntl.F_GETFL) & bit:
+            raise RuntimeError(CACHE_MODE + ' flag missing: buffered fallback is forbidden')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_into(fd, buf, offset):
+    if SYSTEM == 'Darwin':
+        return darwin_io().read_into(fd, buf, offset)
+    return os.preadv(fd, [buf], offset)
+
+
+def cache_columns():
+    return {'os_family': SYSTEM, 'cache_mode': CACHE_MODE, 'cache_bypass_verified': 1}
 
 
 def size_bytes(value):
@@ -86,34 +185,39 @@ def capture(cmd):
 
 
 def proc_io():
+    if SYSTEM == 'Darwin':
+        return darwin_io().io()
     return {k: int(v) for k, v in (line.split(':') for line in Path('/proc/self/io').read_text().splitlines())}
 
 
 def direct_probe(path):
-    """Two reads of the same range must both reach the Linux storage I/O path."""
-    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECT)
+    """Two reads of the same range must both be accounted as process disk I/O."""
+    fd = open_uncached(path)
     try:
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-        if not flags & os.O_DIRECT:
-            raise RuntimeError('O_DIRECT missing: buffered fallback is forbidden')
         reads = []
         with mmap.mmap(-1, MIB) as buf:
             for _ in range(2):
                 before = proc_io()['read_bytes']
-                got = os.preadv(fd, [buf], 0)
+                got = read_into(fd, buf, 0)
                 actual = proc_io()['read_bytes'] - before
                 if got != MIB or actual < MIB:
-                    raise RuntimeError('Cannot verify direct storage reads: got=%d, /proc read_bytes=%d. '
+                    raise RuntimeError('Cannot verify uncached storage reads: got=%d, process disk read_bytes=%d. '
                                        'Use a local block-backed filesystem; RAM filesystems are not supported.' % (got, actual))
                 reads.append({'requested_bytes': MIB, 'returned_bytes': got, 'process_read_bytes': actual})
-        return {'fcntl_O_DIRECT': True, 'flags_octal': oct(flags), 'repeated_same_range_reads': reads,
-                'scope': 'Bypasses Linux page cache; does not bypass drive/controller caches.'}
+        return {**cache_columns(), 'fcntl_O_DIRECT': SYSTEM == 'Linux',
+                'fcntl_F_NOCACHE': SYSTEM == 'Darwin', 'flags_octal': oct(flags),
+                'counter_source': 'proc_pid_rusage(RUSAGE_INFO_V2)' if SYSTEM == 'Darwin' else '/proc/self/io',
+                'repeated_same_range_reads': reads,
+                'scope': 'Bypasses host file-data cache; does not bypass drive/controller caches.'}
     finally:
         os.close(fd)
 
 
 def inspect_direct_fd(pid, path):
     """fio uses thread=1, so job descriptors are visible in its process fd table."""
+    if SYSTEM == 'Darwin':
+        return darwin_io().inspect_fd(pid, path)
     root = Path('/proc') / str(pid)
     try:
         for entry in (root / 'fd').iterdir():
@@ -135,6 +239,32 @@ def inspect_direct_fd(pid, path):
 
 
 def environment(target, args, fio_version):
+    if SYSTEM == 'Darwin':
+        # df resolves firmlinks and paths inside APFS volumes to their device.
+        listing = capture(['df', '-P', str(target)])
+        device = listing.splitlines()[-1].split()[0] if listing else ''
+        if not device.startswith('/dev/disk'):
+            raise RuntimeError('macOS target must be a local disk-backed volume')
+        result = subprocess.run(['diskutil', 'info', '-plist', device], capture_output=True, timeout=15)
+        if result.returncode:
+            raise RuntimeError('diskutil could not identify the target volume')
+        disk = plistlib.loads(result.stdout)
+        if disk.get('VirtualOrPhysical') == 'Virtual' and 'disk image' in str(disk).lower():
+            raise RuntimeError('Disk-image targets are not supported for device measurements')
+        return {'tool_version': VERSION, 'created_utc': utc(), 'label': args.label,
+                'os': platform.platform(), 'kernel': platform.release(), 'machine': platform.machine(),
+                'cpu': capture(['sysctl', '-n', 'machdep.cpu.brand_string']) or platform.processor(),
+                'logical_cpus': os.cpu_count(), 'python': platform.python_version(), 'fio': fio_version,
+                'target': str(target), 'mount': {k: disk.get(k) for k in
+                ['DeviceIdentifier', 'DeviceNode', 'MountPoint', 'FilesystemType', 'FilesystemName',
+                 'SolidState', 'BusProtocol', 'Internal', 'VirtualOrPhysical']},
+                'memory_bytes': capture(['sysctl', '-n', 'hw.memsize']),
+                'aio_limits': {k: capture(['sysctl', '-n', k]) for k in
+                               ['kern.aiomax', 'kern.aioprocmax', 'kern.aiothreads']},
+                'free_bytes_before': shutil.disk_usage(target).free, 'arguments': vars(args).copy(),
+                'temperature_sensor_paths': [],
+                'cache_policy': 'F_NOCACHE mandatory. No host data-cache fallback. Device cache remains enabled.',
+                'status': 'preparing'}
     mount_text = capture(['findmnt', '-J', '-T', str(target), '-o', 'SOURCE,FSTYPE,TARGET,MAJ:MIN,OPTIONS'])
     mounts = json.loads(mount_text).get('filesystems', []) if mount_text else []
     mount = mounts[0] if mounts else {}
@@ -240,7 +370,7 @@ def run_fio(cmd, stem, out, data, env, timeout, require_fd):
     if process.returncode:
         raise RuntimeError('fio failed (%d), see raw/%s.log and raw/%s.json' % (process.returncode, stem, stem))
     if require_fd and observations['direct_fd'] is None:
-        raise RuntimeError('Could not observe the fio O_DIRECT descriptor; refusing an unverified result: ' + stem)
+        raise RuntimeError('Could not observe the fio ' + CACHE_MODE + ' descriptor; refusing an unverified result: ' + stem)
     result = json.loads((out / 'raw' / (stem + '.json')).read_text())
     jobs = result.get('jobs', [])
     if len(jobs) != 1 or jobs[0].get('error', 0):
@@ -266,6 +396,17 @@ def fio_base(fio, args, data):
             '--invalidate=1', '--allow_file_create=0', '--output-format=json', '--eta=never']
 
 
+def depth_assessment(qd, depth):
+    bucket = max(n for n in [1, 2, 4, 8, 16, 32, 64] if n <= qd)
+    key = '>=64' if bucket == 64 else str(bucket)
+    pct = depth.get(key, 0)
+    if qd == 1:
+        return 'QD1', pct
+    if pct < 1.0:
+        return 'below_requested_depth_bucket', pct
+    return ('observed_ge64_exact_depth_unknown' if qd >= 64 else 'requested_depth_bucket_observed'), pct
+
+
 def metric_row(args, profile, rep, job, audit):
     read = job['read']
     if read.get('io_bytes', 0) <= 0 or read.get('runtime', 0) <= 0:
@@ -280,8 +421,10 @@ def metric_row(args, profile, rep, job, audit):
         raise RuntimeError('fio completion-latency percentiles are missing')
     bw = read.get('bw_bytes', read.get('bw', 0) * 1024)
     depth = job.get('iodepth_level', {})
+    depth_status, depth_pct = depth_assessment(profile['qd'], depth)
     row = {'label': args.label, 'profile': profile['profile'], 'block_bytes': profile['block_bytes'],
            'queue_depth': profile['qd'], 'jobs': 1, 'engine': args.engine, 'direct_io': 1,
+           **cache_columns(), 'qd_status': depth_status, 'requested_depth_bucket_pct': depth_pct,
            'file_size_bytes': args.size, 'runtime_requested_s': args.runtime, 'ramp_s': args.ramp,
            'repetition': rep, 'read_GiB_s': bw / GIB, 'read_MB_s': bw / 1e6,
            'read_IOPS': read['iops'], 'read_bytes': read['io_bytes'],
@@ -292,7 +435,8 @@ def metric_row(args, profile, rep, job, audit):
            'iodepth_4_pct': depth.get('4', 0), 'iodepth_8_pct': depth.get('8', 0),
            'iodepth_16_pct': depth.get('16', 0), 'iodepth_32_pct': depth.get('32', 0),
            'iodepth_ge64_pct': depth.get('>=64', 0),
-           'fio_fd_O_DIRECT_verified': int(bool(audit['direct_fd'])),
+           'fio_fd_O_DIRECT_verified': int(bool(audit['direct_fd'])) if SYSTEM == 'Linux' else '',
+           'fio_fd_F_NOCACHE_verified': int(bool(audit['direct_fd'])) if SYSTEM == 'Darwin' else '',
            'temperature_start_max_C': max(audit['temperature_start_c'].values(), default=''),
            'temperature_peak_C': audit['temperature_peak_c'] if audit['temperature_peak_c'] is not None else '',
            'started_utc': audit['started_utc']}
@@ -310,6 +454,10 @@ def summarize(rows):
         med = statistics.median(bw)
         result.append({'label': first['label'], 'profile': key[0], 'block_bytes': key[1],
                        'queue_depth': key[2], 'jobs': 1, 'engine': first['engine'], 'direct_io': 1,
+                       'os_family': first.get('os_family', 'Linux'),
+                       'cache_mode': first.get('cache_mode', 'O_DIRECT'),
+                       'cache_bypass_verified_all': int(all(r.get('cache_bypass_verified', r['fio_fd_O_DIRECT_verified']) for r in group)),
+                       'qd_status': ';'.join(sorted(set(r.get('qd_status', '') for r in group))),
                        'file_size_bytes': first['file_size_bytes'], 'runtime_requested_s': first['runtime_requested_s'],
                        'ramp_s': first['ramp_s'], 'repetitions_completed': len(group),
                        'read_GiB_s_median': med, 'read_GiB_s_min': min(bw), 'read_GiB_s_max': max(bw),
@@ -319,7 +467,7 @@ def summarize(rows):
                        'clat_mean_us_median': statistics.median(r['clat_mean_us'] for r in group),
                        'clat_p50_us_median': statistics.median(r['clat_p50_us'] for r in group),
                        'clat_p99_us_median': statistics.median(r['clat_p99_us'] for r in group),
-                       'fio_fd_O_DIRECT_verified_all': int(all(r['fio_fd_O_DIRECT_verified'] for r in group))})
+                       'fio_fd_O_DIRECT_verified_all': int(all(r['fio_fd_O_DIRECT_verified'] for r in group)) if first.get('cache_mode', 'O_DIRECT') == 'O_DIRECT' else ''})
     return result
 
 
@@ -338,12 +486,15 @@ def comparisons(summary):
             continue
         s, l, h = [r['read_GiB_s_median'] for r in [seq, low, high]]
         result.append({'label': low['label'], 'random_block_KiB': low['block_bytes'] / 1024,
+                       'os_family': low['os_family'], 'cache_mode': low['cache_mode'], 'engine': low['engine'],
                        'sequential_block_KiB': seq['block_bytes'] / 1024,
                        'sequential_QD': seq['queue_depth'], 'random_low_QD': low['queue_depth'],
                        'random_high_QD': high['queue_depth'], 'sequential_GiB_s': s,
                        'random_low_QD_GiB_s': l, 'random_high_QD_GiB_s': h,
                        'low_QD_vs_sequential_pct': 100 * l / s,
                        'high_QD_vs_sequential_pct': 100 * h / s, 'high_vs_low_QD_x': h / l,
+                       'sequential_qd_status': seq['qd_status'], 'low_QD_status': low['qd_status'],
+                       'high_QD_status': high['qd_status'],
                        'sequential_reps': seq['repetitions_completed'],
                        'low_QD_reps': low['repetitions_completed'], 'high_QD_reps': high['repetitions_completed']})
     return result
@@ -367,10 +518,8 @@ def measure_pattern(args, name, useful_size, rep, data, env):
     rng = random.Random(args.seed + rep)
     # Bounded precomputed trace: offset generation is outside timed storage work.
     offsets = [rng.randrange(args.size // useful_size) * useful_size for _ in range(32768)]
-    fd = os.open(str(data), os.O_RDONLY | os.O_DIRECT)
+    fd = open_uncached(data)
     try:
-        if not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT:
-            raise RuntimeError('Pattern workload O_DIRECT flag missing')
         with mmap.mmap(-1, block) as buf:
             def run_for(seconds):
                 count, checksum, pos = 0, 0, 0
@@ -379,7 +528,7 @@ def measure_pattern(args, name, useful_size, rep, data, env):
                 while time.perf_counter() < deadline:
                     logical = offsets[pos]
                     physical = logical // 4096 * 4096
-                    if os.preadv(fd, [buf], physical) != block:
+                    if read_into(fd, buf, physical) != block:
                         raise RuntimeError('Short direct pattern read')
                     payload = buf[logical - physical:logical - physical + useful_size]
                     checksum ^= payload[0]
@@ -399,13 +548,15 @@ def measure_pattern(args, name, useful_size, rep, data, env):
     if not count or actual < count * block:
         raise RuntimeError('Pattern physical read count is smaller than the requested direct I/O')
     return {'label': args.label, 'workload': name, 'kind': 'pattern_proxy', 'repetition': rep,
-            'direct_io': 1, 'queue_depth': 1, 'engine': 'synchronous_preadv',
+            'direct_io': 1, **cache_columns(), 'queue_depth': 1,
+            'engine': 'synchronous_pread' if SYSTEM == 'Darwin' else 'synchronous_preadv',
             'file_size_bytes': args.size, 'physical_request_bytes': block, 'useful_request_bytes': useful_size,
             'runtime_requested_s': args.runtime, 'ramp_s': args.ramp, 'measured_runtime_s': elapsed,
             'requests': count, 'physical_read_bytes': actual, 'useful_read_bytes': count * useful_size,
             'storage_GiB_s': actual / elapsed / GIB, 'useful_GiB_s': count * useful_size / elapsed / GIB,
             'requests_s': count / elapsed, 'io_amplification': actual / (count * useful_size),
-            'fcntl_O_DIRECT_verified': 1, 'checksum': checksum,
+            'fcntl_O_DIRECT_verified': 1 if SYSTEM == 'Linux' else '',
+            'fcntl_F_NOCACHE_verified': 1 if SYSTEM == 'Darwin' else '', 'checksum': checksum,
             'temperature_start_max_C': max(start_temp.values(), default=''),
             'temperature_end_max_C': max(end_temp.values(), default=''), 'started_utc': started}
 
@@ -426,6 +577,7 @@ def workload_tables(out, work_rows, fio_rows):
         high = next((r for r in refs if r['profile'] == 'random_read_high_qd' and
                      r['block_bytes'] == first['physical_request_bytes']), None)
         row = {'label': first['label'], 'workload': name, 'kind': first['kind'], 'direct_io': 1,
+               'os_family': first.get('os_family', 'Linux'), 'cache_mode': first.get('cache_mode', 'O_DIRECT'),
                'physical_request_bytes': first['physical_request_bytes'],
                'useful_request_bytes': first['useful_request_bytes'], 'workload_QD': 1,
                'file_size_bytes': first['file_size_bytes'], 'runtime_requested_s': first['runtime_requested_s'],
@@ -448,7 +600,8 @@ def workload_tables(out, work_rows, fio_rows):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(prog='bench.sh', description='Linux storage read benchmark with mandatory O_DIRECT. '
+    parser = argparse.ArgumentParser(prog='bench.sh', description='Linux/macOS storage read benchmark with mandatory cache bypass '
+        '(O_DIRECT on Linux, F_NOCACHE on macOS). '
         'Creates and fully writes a NEW temporary file on the target filesystem, reads it, then deletes it. '
         'Requires Python 3.8+ and fio 3.x; does not require root.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -464,12 +617,12 @@ def parse_args(argv=None):
     parser.add_argument('--random-bs', default='4K,16K,128K,1M', help='comma-separated random request sizes')
     parser.add_argument('--low-qd', type=positive, default=1, help='low random queue depth')
     parser.add_argument('--high-qd', type=positive, default=128, help='high random queue depth')
-    parser.add_argument('--engine', choices=['auto', 'libaio', 'io_uring'], default='auto', help='asynchronous fio engine')
+    parser.add_argument('--engine', choices=['auto', 'libaio', 'io_uring', 'posixaio'], default='auto', help='asynchronous fio engine')
     parser.add_argument('--fio', default='fio', help='fio executable name or path')
     parser.add_argument('--seed', type=nonnegative, default=20261008, help='reproducible profile order and random I/O seed')
     parser.add_argument('--pause', type=nonnegative, default=1, help='idle seconds between runs')
     parser.add_argument('--workloads', choices=['patterns', 'none'], default='patterns',
-                        help='also measure three QD1 AI access-pattern proxies using direct preadv')
+                        help='also measure three QD1 AI access-pattern proxies using uncached reads')
     parser.add_argument('--max-temp-c', type=float, help='wait before each run until all discovered target sensors are <= this value')
     parser.add_argument('--cool-timeout', type=positive, default=600, help='maximum temperature wait, seconds')
     args = parser.parse_args(argv)
@@ -493,8 +646,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if platform.system() != 'Linux' or sys.version_info < (3, 8):
-        raise RuntimeError('Linux and Python 3.8+ are required')
+    if SYSTEM not in ('Linux', 'Darwin') or sys.version_info < (3, 8):
+        raise RuntimeError('Linux or macOS and Python 3.8+ are required')
     target = Path(args.target).expanduser().resolve(strict=True)
     if not target.is_dir():
         raise RuntimeError('--target must be an existing directory, never a raw block device')
@@ -505,12 +658,13 @@ def main(argv=None):
     version = capture([fio, '--version']) if fio else None
     if not version or not re.match(r'^fio-3\.', version):
         raise RuntimeError('fio 3.x is required (the Flexible I/O Tester, not Fiona). '
-                           'Install using your OS package manager, e.g. apt install fio or dnf install fio.')
+                           'Install using apt install fio, dnf install fio, or brew install fio on macOS.')
     engines = capture([fio, '--enghelp']) or ''
+    supported = ['posixaio'] if SYSTEM == 'Darwin' else ['libaio', 'io_uring', 'posixaio']
     if args.engine == 'auto':
-        args.engine = next((e for e in ['libaio', 'io_uring'] if e in engines.split()), None)
-    if not args.engine or args.engine not in engines.split():
-        raise RuntimeError('fio needs an asynchronous libaio or io_uring engine; no synchronous fallback')
+        args.engine = next((e for e in supported if e in engines.split()), None)
+    if not args.engine or args.engine not in engines.split() or args.engine not in supported:
+        raise RuntimeError('fio needs an available asynchronous engine supported on this OS: ' + ', '.join(supported))
     if shutil.disk_usage(target).free < args.size + GIB:
         raise RuntimeError('Insufficient space: need --size plus 1 GiB of reserve on target')
     env = environment(target, args, version)
@@ -546,7 +700,7 @@ def main(argv=None):
                 os.close(fd)
             base = fio_base(fio, args, data)
             cooling(env, args)
-            print('Preparing a fully written data file (O_DIRECT + fsync)...', flush=True)
+            print('Preparing a fully written data file (' + CACHE_MODE + ' + fsync)...', flush=True)
             prep_cmd = base + ['--name=prepare', '--rw=write', '--bs=1M', '--iodepth=32',
                                '--refill_buffers=1', '--scramble_buffers=1', '--end_fsync=1',
                                '--output=' + str(out / 'raw' / 'prepare.json')]
@@ -573,6 +727,8 @@ def main(argv=None):
                                   '--output=' + str(out / 'raw' / (stem + '.json'))]
                     job, audit = run_fio(cmd, stem, out, data, env, args.runtime + args.ramp + 120, True)
                     row = metric_row(args, profile, rep, job, audit)
+                    if row['qd_status'] == 'below_requested_depth_bucket':
+                        print('  WARNING: actual queue depth stayed below the requested bucket; see qd_status in CSV.', flush=True)
                     rows.append(row)
                     write_tables(out, rows)
                     print('  %.3f GiB/s | %.0f IOPS | p99 %.1f us' %

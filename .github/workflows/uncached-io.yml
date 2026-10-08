@@ -1,0 +1,35 @@
+name: Linux and macOS uncached I/O
+
+on:
+  push:
+    branches: [main]
+    paths: [bench.sh, 'tests/**', '.github/workflows/uncached-io.yml']
+  pull_request:
+    paths: [bench.sh, 'tests/**', '.github/workflows/uncached-io.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fio on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fio
+      - name: Install fio on macOS
+        if: runner.os == 'macOS'
+        run: brew install fio
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+      - name: Syntax and real uncached I/O integration tests
+        run: |
+          sh -n bench.sh
+          python3 tests/test_bench.py --integration

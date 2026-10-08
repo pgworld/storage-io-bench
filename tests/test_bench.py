@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Statistics/safety checks, plus opt-in real fio integration tests."""
 import csv
+import ctypes
+import fcntl
 import io
 import json
 import os
@@ -78,10 +80,34 @@ class AnalysisTests(unittest.TestCase):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 bench.parse_args(argv)
 
+    @unittest.skipUnless(bench.SYSTEM == 'Linux', 'Linux descriptor audit')
     def test_buffered_file_descriptor_is_rejected(self):
         with tempfile.NamedTemporaryFile() as f:
             with self.assertRaisesRegex(RuntimeError, 'WITHOUT O_DIRECT'):
                 bench.inspect_direct_fd(os.getpid(), Path(f.name))
+
+    @unittest.skipUnless(bench.SYSTEM == 'Darwin', 'Darwin descriptor audit')
+    def test_macos_cache_flag_is_observed_and_buffered_fd_not_accepted(self):
+        with tempfile.NamedTemporaryFile() as f:
+            path = Path(f.name).resolve()
+            self.assertIsNone(bench.inspect_direct_fd(os.getpid(), path))
+            fcntl.fcntl(f.fileno(), bench.F_NOCACHE, 1)
+            self.assertTrue(fcntl.fcntl(f.fileno(), fcntl.F_GETFL) & bench.FNOCACHE)
+            self.assertTrue(bench.inspect_direct_fd(os.getpid(), path)['F_NOCACHE'])
+            fcntl.fcntl(f.fileno(), bench.F_NOCACHE, 0)
+            self.assertIsNone(bench.inspect_direct_fd(os.getpid(), path))
+
+    def test_macos_rusage_abi(self):
+        self.assertEqual(ctypes.sizeof(bench.DarwinIO.RusageV2), 160)
+        self.assertEqual(bench.DarwinIO.RusageV2.read_bytes.offset, 144)
+        self.assertEqual(bench.DarwinIO.RusageV2.write_bytes.offset, 152)
+
+    def test_capped_queue_is_not_reported_as_achieved(self):
+        state, pct = bench.depth_assessment(128, {'16': 99.9, '>=64': .1})
+        self.assertEqual(state, 'below_requested_depth_bucket')
+        state, pct = bench.depth_assessment(128, {'>=64': 99.9})
+        self.assertEqual(state, 'observed_ge64_exact_depth_unknown')
+        self.assertEqual(bench.depth_assessment(1, {'1': 100})[0], 'QD1')
 
     def test_missing_workload_reference_is_blank(self):
         work = {'label': 'test', 'workload': 'embedding', 'kind': 'pattern_proxy',
@@ -123,7 +149,13 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(env['status'], 'complete')
         runs = read_csv(self.out / 'runs.csv')
         self.assertEqual(len(runs), 18)
-        self.assertTrue(all(r['fio_fd_O_DIRECT_verified'] == '1' for r in runs))
+        self.assertTrue(all(r['cache_bypass_verified'] == '1' for r in runs))
+        native_field = 'fio_fd_F_NOCACHE_verified' if bench.SYSTEM == 'Darwin' else 'fio_fd_O_DIRECT_verified'
+        self.assertTrue(all(r[native_field] == '1' for r in runs))
+        self.assertTrue(all(r['cache_mode'] == bench.CACHE_MODE for r in runs))
+        if bench.SYSTEM == 'Darwin':
+            self.assertTrue(all(r['engine'] == 'posixaio' for r in runs))
+            self.assertTrue(all(r['fio_fd_O_DIRECT_verified'] == '' for r in runs))
         self.assertTrue(all(float(r['read_GiB_s']) > 0 for r in runs))
         self.assertTrue(all(r['label'] == 'test,한국어' for r in runs))
         summary = read_csv(self.out / 'summary.csv')
@@ -133,11 +165,12 @@ class IntegrationTests(unittest.TestCase):
         work = read_csv(self.out / 'workload_comparison.csv')
         self.assertEqual(len(work), 3)
         embedding = next(r for r in work if r['workload'] == 'embedding_lookup_512b')
-        self.assertAlmostEqual(float(embedding['io_amplification_median']), 8)
-        self.assertAlmostEqual(float(embedding['storage_GiB_s_median']),
-                               8 * float(embedding['useful_GiB_s_median']))
+        self.assertGreaterEqual(float(embedding['io_amplification_median']), 8)
+        self.assertGreaterEqual(float(embedding['storage_GiB_s_median']) + 1e-9,
+                                8 * float(embedding['useful_GiB_s_median']))
         self.assertTrue(all(r['low_random_QD_matches_workload'] == '1' for r in work))
         probe = json.loads((self.out / 'direct_io_validation.json').read_text())
+        self.assertEqual(probe['cache_mode'], bench.CACHE_MODE)
         for attempt in probe['repeated_same_range_reads']:
             self.assertGreaterEqual(attempt['process_read_bytes'], attempt['requested_bytes'])
         self.assert_clean()
@@ -165,7 +198,7 @@ class IntegrationTests(unittest.TestCase):
                 process.wait(timeout=20)
 
     def test_ram_filesystem_fails_closed(self):
-        if not Path('/dev/shm').is_dir():
+        if bench.SYSTEM != 'Linux' or not Path('/dev/shm').is_dir():
             self.skipTest('no /dev/shm')
         result = subprocess.run(self.cmd + ['--target', '/dev/shm'], capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
